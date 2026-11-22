@@ -1,0 +1,14 @@
+{
+  "name": "trikstr-portfolio",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Trikstr Network Portfolio with Advanced SQL Database and Customizer Admin Dashboard",
+  "scripts": {
+    "start": "npx serve .",
+    "test-db": "node test-db.js"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.2.1",
+    "pg": "^8.23.1"
+  }
+}
