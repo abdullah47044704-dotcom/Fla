@@ -9,23 +9,47 @@
  */
 
 import pg from 'pg';
-import { neon } from '@neondatabase/serverless';
+import { neon, Pool as NeonPool } from '@neondatabase/serverless';
 
-const { Pool } = pg;
+const { Pool: PgPool } = pg;
 
-// Supported environment variables
+// Universal environment variable resolver
 export function getConnectionString() {
-  return (
-    process.env.STORAGE_URL ||
-    process.env.POSTGRES_URL ||
-    process.env.DATABASE_URL ||
-    process.env.POSTGRES_PRISMA_URL ||
-    process.env.POSTGRES_URL_NON_POOLING ||
-    process.env.NEON_DATABASE_URL ||
-    process.env.SUPABASE_DATABASE_URL ||
-    process.env.SQL_DATABASE_URL ||
-    null
-  );
+  const priorityKeys = [
+    'POSTGRES_URL',
+    'POSTGRES_PRISMA_URL',
+    'DATABASE_URL',
+    'STORAGE_URL',
+    'POSTGRES_URL_NON_POOLING',
+    'NEON_DATABASE_URL',
+    'SUPABASE_DATABASE_URL',
+    'SQL_DATABASE_URL'
+  ];
+
+  for (const key of priorityKeys) {
+    if (process.env[key] && typeof process.env[key] === 'string' && process.env[key].trim()) {
+      return process.env[key].trim();
+    }
+  }
+
+  // Dynamic scan: ANY environment variable containing postgres:// or postgresql://
+  for (const [key, val] of Object.entries(process.env)) {
+    if (typeof val === 'string' && (val.startsWith('postgres://') || val.startsWith('postgresql://'))) {
+      return val.trim();
+    }
+  }
+
+  // Component fallback: POSTGRES_HOST, POSTGRES_USER, POSTGRES_PASSWORD
+  const host = process.env.POSTGRES_HOST || process.env.STORAGE_HOST || process.env.DB_HOST;
+  const user = process.env.POSTGRES_USER || process.env.STORAGE_USER || process.env.DB_USER;
+  const password = process.env.POSTGRES_PASSWORD || process.env.STORAGE_PASSWORD || process.env.DB_PASSWORD;
+  const database = process.env.POSTGRES_DATABASE || process.env.STORAGE_DATABASE || process.env.DB_NAME || 'neondb';
+
+  if (host && user && password) {
+    return `postgres://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}/${database}?sslmode=require`;
+  }
+
+  return null;
 }
 
 export function isSqlConfigured() {
@@ -49,15 +73,24 @@ function getPool() {
   if (!connectionString) return null;
 
   if (!globalPool) {
-    globalPool = new Pool({
-      connectionString,
-      ssl: {
-        rejectUnauthorized: false
-      },
-      max: 6,
-      idleTimeoutMillis: 20000,
-      connectionTimeoutMillis: 7000
-    });
+    if (connectionString.includes('neon.tech')) {
+      globalPool = new NeonPool({
+        connectionString,
+        max: 6,
+        idleTimeoutMillis: 20000,
+        connectionTimeoutMillis: 7000
+      });
+    } else {
+      globalPool = new PgPool({
+        connectionString,
+        ssl: {
+          rejectUnauthorized: false
+        },
+        max: 6,
+        idleTimeoutMillis: 20000,
+        connectionTimeoutMillis: 7000
+      });
+    }
 
     globalPool.on('error', (err) => {
       console.error('[SQL Pool Error]', err);
@@ -68,7 +101,7 @@ function getPool() {
 }
 
 /**
- * Execute query using Neon HTTP driver if Neon URL, or standard pg Pool
+ * Execute query using Neon HTTP driver if Neon URL, or pooled client
  */
 export async function executeQuery(text, params = []) {
   const connStr = getConnectionString();
@@ -79,11 +112,12 @@ export async function executeQuery(text, params = []) {
   // Fast-path: Neon HTTP driver for ultra-low latency serverless fetch
   if (connStr.includes('neon.tech')) {
     try {
-      const sql = neon(connStr);
-      const rows = await sql.query(text, params);
-      return { rows: Array.isArray(rows) ? rows : [rows] };
+      const sql = neon(connStr, { fullResults: true });
+      const res = await sql.query(text, params);
+      const rows = res.rows || (Array.isArray(res) ? res : [res]);
+      return { rows };
     } catch (neonErr) {
-      console.warn('[Neon HTTP Driver warning, falling back to pg.Pool]:', neonErr.message);
+      console.warn('[Neon HTTP Driver warning, falling back to Pool]:', neonErr.message);
     }
   }
 
@@ -104,14 +138,16 @@ export async function executeQuery(text, params = []) {
 export async function ensureSchema(defaultConfig = null) {
   if (isSchemaReady) return;
 
-  const createTablesSql = `
+  const createTable1 = `
     CREATE TABLE IF NOT EXISTS site_config (
       id VARCHAR(64) PRIMARY KEY,
       config_data JSONB NOT NULL,
       admin_password VARCHAR(255) NOT NULL DEFAULT '1234',
       updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
+  `;
 
+  const createTable2 = `
     CREATE TABLE IF NOT EXISTS admin_audit_logs (
       id SERIAL PRIMARY KEY,
       action VARCHAR(100) NOT NULL,
@@ -121,7 +157,8 @@ export async function ensureSchema(defaultConfig = null) {
     );
   `;
 
-  await executeQuery(createTablesSql);
+  await executeQuery(createTable1);
+  await executeQuery(createTable2);
 
   // Check if active config exists
   const checkRes = await executeQuery(
